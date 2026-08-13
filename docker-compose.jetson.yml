@@ -1,0 +1,82 @@
+# Jetson Orin (aarch64 / NVIDIA L4T) deployment.
+#
+# Default path — pulls the published multi-arch release image. linux/arm64 is
+# built by .github/workflows/docker-ghcr.yml, so nothing is compiled on the
+# Jetson:
+#
+#   docker compose -f docker-compose.jetson.yml up -d
+#
+# CUDA path — build locally from Dockerfile.jetson on top of an l4t-jetpack
+# base instead of pulling the release image:
+#
+#   docker compose -f docker-compose.jetson.yml -f docker-compose.jetson-gpu.yml up -d --build
+#
+# Ports are non-standard on purpose so this stack can share a Jetson with other
+# projects. Copy .env.jetson.example to .env to change them or to point
+# MPT_HOST at this host's LAN address.
+#
+# 说明：docker-compose.gpu.yml 面向独立显卡（nvidia/cuda 基础镜像 +
+# deploy.resources.devices），在 Jetson 的集成 GPU 上不可用，因此单独提供本文件。
+
+x-common-volumes: &common-volumes
+  # This checkout is mounted over the image's own copy of the application, the
+  # same way the upstream docker-compose.yml does it. The release image supplies
+  # the installed Python dependencies and ffmpeg; the code that actually runs
+  # comes from this repository.
+  #
+  # Without this, the containers run upstream's code and anything added here —
+  # the ollama_cloud provider, for example — simply does not exist inside them.
+  # An unknown llm_provider is silently reset to the default in the WebUI
+  # (webui/Main.py), so the failure shows up as a provider that keeps reverting
+  # rather than as an error.
+  #
+  # config.toml, storage/ and models/ live in this directory, so they are
+  # covered by the same mount and still persist on the host.
+  #
+  # Note: dependencies come from the image. If this checkout ever gains a new
+  # Python dependency, switch to the local build in
+  # docker-compose.jetson-gpu.yml, which installs from uv.lock.
+  - ./:/MoneyPrinterTurbo
+
+x-jetson-gpu: &jetson-gpu
+  # Deliberately NOT the nvidia runtime by default.
+  #
+  # Tegra exposes its integrated GPU by having the nvidia container runtime
+  # mount host libraries into the container (not through
+  # `deploy.resources.reservations.devices`, which asks for a discrete GPU and
+  # fails on Orin). Those libraries are built against the host's Ubuntu, while
+  # the release image is Debian bullseye. Injecting them shadows the container's
+  # own libraries with ones linked against a newer libffi, and ffmpeg then dies
+  # with "libffi.so.8: cannot open shared object file" partway through a render.
+  #
+  # Nothing in the release image can use the GPU anyway — see "What the GPU
+  # actually does here" in docs/jetson-orin.md — so the injection is all cost.
+  # The local CUDA build in docker-compose.jetson-gpu.yml turns the runtime back
+  # on: its l4t-jetpack base matches the host's userspace, so the mounts are safe
+  # there.
+  #
+  # Set MPT_RUNTIME=nvidia in .env to force GPU access on this path anyway.
+  runtime: ${MPT_RUNTIME:-runc}
+  environment:
+    NVIDIA_VISIBLE_DEVICES: all
+    NVIDIA_DRIVER_CAPABILITIES: ${MPT_NVIDIA_CAPS:-compute,utility}
+
+services:
+  webui:
+    <<: *jetson-gpu
+    image: ghcr.io/harry0703/moneyprinterturbo:latest
+    container_name: "moneyprinterturbo-webui"
+    ports:
+      - "${MPT_BIND_ADDR:-0.0.0.0}:${MPT_WEBUI_PORT:-3200}:8501"
+    command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=${MPT_HOST:-localhost}", "--browser.serverPort=${MPT_WEBUI_PORT:-3200}", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
+    volumes: *common-volumes
+    restart: always
+  api:
+    <<: *jetson-gpu
+    image: ghcr.io/harry0703/moneyprinterturbo:latest
+    container_name: "moneyprinterturbo-api"
+    ports:
+      - "${MPT_BIND_ADDR:-0.0.0.0}:${MPT_API_PORT:-8200}:8080"
+    command: [ "python3", "main.py" ]
+    volumes: *common-volumes
+    restart: always

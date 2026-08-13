@@ -1,0 +1,33 @@
+# Jetson CUDA build override.
+#
+# Usage:
+#   docker compose -f docker-compose.jetson.yml -f docker-compose.jetson-gpu.yml up -d --build
+#
+# Replaces the prebuilt release image with a local build on top of NVIDIA's
+# l4t-jetpack base, so CUDA, cuDNN and TensorRT are present inside the
+# container. Pick the base tag that matches this board's L4T release — see
+# docs/jetson-orin.md; `scripts/install-jetson.sh` detects it automatically and
+# writes it to .env as L4T_BASE_IMAGE.
+#
+# Expect a long first build (the l4t-jetpack base alone is several GB) and only
+# choose this path when something in the container genuinely needs CUDA. On the
+# stock dependency set the release image gives the same output — see the
+# "What the GPU actually does here" section of docs/jetson-orin.md.
+#
+# This image is built on l4t-jetpack, whose userspace matches the host's, so the
+# libraries the nvidia runtime mounts in are ABI-compatible here and the runtime
+# is switched back on. Capabilities stay at compute,utility: the graphics set
+# pulls in EGL/GL libraries this workload never calls.
+services:
+  webui: &jetson-build
+    image: moneyprinterturbo-jetson:local
+    build:
+      context: .
+      dockerfile: Dockerfile.jetson
+      args:
+        L4T_BASE_IMAGE: ${L4T_BASE_IMAGE:-nvcr.io/nvidia/l4t-jetpack:r36.4.0}
+    runtime: ${MPT_RUNTIME:-nvidia}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: ${MPT_NVIDIA_CAPS:-compute,utility}
+  api: *jetson-build

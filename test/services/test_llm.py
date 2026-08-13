@@ -312,6 +312,7 @@ class TestLiteLLMProvider(unittest.TestCase):
                 "aimlapi",
                 "evolink",
                 "ollama",
+                "ollama_cloud",
                 "oneapi",
                 "litellm",
                 "groq",
@@ -1199,6 +1200,70 @@ class TestLiteLLMProvider(unittest.TestCase):
 
         with patch.object(config, "is_running_in_container", return_value=True):
             self._assert_ollama_base_url("http://ollama:11434/v1")
+
+    def test_ollama_cloud_uses_subscription_key_and_hosted_base_url(self):
+        """
+        Ollama Cloud 与本机 Ollama 是两个独立 Provider。本机 Ollama 会被服务层
+        固定写入占位 api_key，云端必须原样使用用户订阅的真实 Key，并默认走
+        ollama.com 的 OpenAI 兼容地址，否则请求会被 401 拒绝。
+        """
+        config.app["llm_provider"] = "ollama_cloud"
+        config.app["ollama_cloud_api_key"] = "ollama-cloud-key"
+        config.app["ollama_cloud_base_url"] = ""
+        config.app["ollama_cloud_model_name"] = "gpt-oss:120b"
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                message = types.SimpleNamespace(content="hello\ncloud")
+                choice = types.SimpleNamespace(message=message)
+                return types.SimpleNamespace(choices=[choice])
+
+        fake_completions = FakeCompletions()
+        fake_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=fake_completions)
+        )
+
+        with (
+            patch.object(llm, "OpenAI", return_value=fake_client) as openai_client,
+            patch.object(llm, "ChatCompletion", types.SimpleNamespace),
+            # 容器检测只影响本机 Ollama 的默认地址，云端不应受它影响。
+            patch.object(config, "is_running_in_container", return_value=True),
+        ):
+            result = llm._generate_response("Say hello")
+
+        openai_client.assert_called_once_with(
+            api_key="ollama-cloud-key",
+            base_url="https://ollama.com/v1",
+        )
+        self.assertEqual(fake_completions.kwargs["model"], "gpt-oss:120b")
+        self.assertEqual(result, "hellocloud")
+
+    def test_ollama_cloud_requires_api_key(self):
+        """云端订阅缺少 Key 时必须直接报错，而不是退化成匿名请求。"""
+        config.app["llm_provider"] = "ollama_cloud"
+        config.app["ollama_cloud_api_key"] = ""
+        config.app["ollama_cloud_base_url"] = ""
+        config.app["ollama_cloud_model_name"] = "gpt-oss:120b"
+
+        # _generate_response 统一把异常转成 "Error: ..." 文案返回给调用方。
+        result = llm._generate_response("Say hello")
+
+        self.assertIn("api_key is not set", result)
+
+    def test_providers_with_dynamic_catalogs_declare_model_listing(self):
+        """
+        模型目录会随服务方调整变化的 Provider 由 WebUI 拉取真实列表，
+        因此必须声明 supports_model_listing，避免退回易过期的硬编码模型名。
+        """
+        for provider_id in ("groq", "ollama_cloud"):
+            provider = get_llm_provider(provider_id)
+            self.assertIsNotNone(provider)
+            self.assertTrue(provider.supports_model_listing, provider_id)
+            self.assertTrue(provider.default_base_url, provider_id)
+
+        # 本机 Ollama 的模型来自 `ollama list`，没有可用的云端目录接口。
+        self.assertFalse(get_llm_provider("ollama").supports_model_listing)
 
     def test_mimo_provider_uses_openai_compatible_client(self):
         """
