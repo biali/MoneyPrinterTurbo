@@ -37,6 +37,10 @@ class LLMProviderSpec:
     requires_base_url: bool = True
     show_api_key: bool = True
     show_base_url: bool = True
+    # Provider 暴露 OpenAI 兼容的 `/models` 接口，且模型目录会随时间变化。
+    # WebUI 会用当前 API Key 拉取真实模型列表并渲染为下拉框，避免把易过期的
+    # 模型名硬编码在 Registry 里。
+    supports_model_listing: bool = False
     deprecated_models: tuple[str, ...] = ()
     deprecated_base_urls: tuple[str, ...] = ()
     extra_fields: tuple[LLMProviderField, ...] = ()
@@ -222,6 +226,17 @@ LLM_PROVIDER_REGISTRY = (
         requires_api_key=False,
         show_api_key=False,
     ),
+    # ollama.com 上的托管模型。与本地 `ollama` 是两个 Provider：本地部署不需要
+    # 凭据，服务层为它固定写入占位 api_key；云端必须携带真实的订阅 Key，两者
+    # 无法共用同一份配置。云端模型目录变化较快，因此不预置 default_model，
+    # 改为在 WebUI 中按 Key 拉取当前账号可用的模型。
+    LLMProviderSpec(
+        "ollama_cloud",
+        "Ollama Cloud",
+        api_key_url="https://ollama.com/settings/keys",
+        default_base_url="https://ollama.com/v1",
+        supports_model_listing=True,
+    ),
     LLMProviderSpec(
         "oneapi",
         "OneAPI",
@@ -244,6 +259,7 @@ LLM_PROVIDER_REGISTRY = (
         api_key_url="https://console.groq.com/keys",
         default_model="llama-3.3-70b-versatile",
         default_base_url="https://api.groq.com/openai/v1",
+        supports_model_listing=True,
     ),
     LLMProviderSpec(
         "pollinations",

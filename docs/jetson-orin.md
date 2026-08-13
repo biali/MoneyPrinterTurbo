@@ -42,6 +42,8 @@ small GPU surface:
   The encoder probe in `app/services/video.py` detects the missing encoder and
   falls back to `libx264` automatically, so setting it is harmless but pointless.
 - **LLM, TTS and material search** are all remote API calls. No local inference.
+  Script generation can run on [Ollama Cloud](#llm-provider-ollama-cloud), which
+  keeps the heavy model off the board entirely.
 
 So: **run the release image**. The CUDA path below exists so that CUDA, cuDNN
 and TensorRT are present in the container if you later swap in a CUDA-enabled
@@ -82,7 +84,8 @@ board's L4T release and LAN address, creates `config.toml`, `storage/`,
 `models/` and `.env`, then pulls the arm64 image and starts both containers.
 Re-running it leaves existing configuration alone.
 
-Options: `--webui-port`, `--api-port`, `--bind`, `--gpu-build`, `--no-start`.
+Options: `--webui-port`, `--api-port`, `--bind`, `--gpu-build`, `--ollama-cloud`,
+`--no-start`.
 
 ## Manual start
 
@@ -127,6 +130,49 @@ download links are built from it.
 LAN can reach it and read the API keys stored in `config.toml`. On an untrusted
 network, set `MPT_BIND_ADDR=127.0.0.1` and tunnel:
 `ssh -L 3200:127.0.0.1:3200 <user>@192.168.1.156`.
+
+## LLM provider: Ollama Cloud
+
+An [ollama.com](https://ollama.com) subscription is a good fit for this board.
+Script and keyword generation is the one step that would otherwise want a big
+local model, and the Orin has neither the memory nor the throughput for it —
+`ollama_cloud` runs the model on Ollama's servers and leaves the Jetson doing
+assembly and encoding.
+
+The installer can set it up:
+
+```bash
+export OLLAMA_API_KEY=...   # from https://ollama.com/settings/keys
+./scripts/install-jetson.sh --ollama-cloud
+```
+
+It lists the models your subscription can reach and asks which one to use, then
+writes `llm_provider`, the key, the base URL and the model into `config.toml`.
+Pass `OLLAMA_MODEL=<id>` to skip the prompt. If `OLLAMA_API_KEY` is unset the
+script prompts for it with echo off, so the key never reaches your shell
+history. Re-run it on an existing install to switch providers or models.
+
+By hand, in `config.toml`:
+
+```toml
+[app]
+llm_provider = "ollama_cloud"
+ollama_cloud_api_key = "..."
+ollama_cloud_base_url = "https://ollama.com/v1"
+ollama_cloud_model_name = "gpt-oss:120b"
+```
+
+This is a separate provider from `ollama`. The local one needs no credential
+and the service layer hardcodes a placeholder key for it, so it cannot carry a
+real subscription key; the cloud one requires it. Use `ollama` for a model
+running on your own machine, `ollama_cloud` for hosted ones.
+
+In the WebUI, picking **Ollama Cloud** and entering the key loads the current
+catalog for your account into the model dropdown, rather than relying on a
+model name hardcoded in this repository. **Test LLM Connection** in the same
+panel verifies the whole path — key, endpoint and model — before you generate
+anything. Run it once after setup: it is the fastest way to confirm the
+OpenAI-compatible endpoint is reachable from the Jetson.
 
 ## Configuration
 

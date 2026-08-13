@@ -32,6 +32,8 @@ API_PORT="${MPT_API_PORT:-8200}"
 BIND_ADDR="${MPT_BIND_ADDR:-0.0.0.0}"
 GPU_BUILD=0
 START=1
+OLLAMA_CLOUD=0
+readonly OLLAMA_CLOUD_BASE_URL="https://ollama.com/v1"
 
 log()  { printf '\033[0;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[0;32m  ok\033[0m %s\n' "$*"; }
@@ -49,9 +51,18 @@ Usage: scripts/install-jetson.sh [options]
   --gpu-build         Build the CUDA image from Dockerfile.jetson instead of
                       pulling the prebuilt arm64 release image. Slow; see
                       docs/jetson-orin.md before choosing it.
+  --ollama-cloud      Configure Ollama Cloud (ollama.com) as the LLM provider.
+                      Reads the key from $OLLAMA_API_KEY, or prompts for it,
+                      then lists the models your subscription can reach so you
+                      can pick one. Never pass the key as an argument — it
+                      would land in your shell history.
   --no-start          Prepare config.toml, .env and directories, then stop
                       without pulling or starting containers.
   -h, --help          Show this help.
+
+Environment:
+  OLLAMA_API_KEY      Ollama Cloud API key, used by --ollama-cloud.
+  OLLAMA_MODEL        Cloud model id to select non-interactively.
 EOF
 }
 
@@ -61,6 +72,7 @@ while [[ $# -gt 0 ]]; do
         --api-port)   API_PORT="${2:?--api-port needs a value}"; shift 2 ;;
         --bind)       BIND_ADDR="${2:?--bind needs a value}"; shift 2 ;;
         --gpu-build)  GPU_BUILD=1; shift ;;
+        --ollama-cloud) OLLAMA_CLOUD=1; shift ;;
         --no-start)   START=0; shift ;;
         -h|--help)    usage; exit 0 ;;
         *)            usage >&2; die "unknown option: $1" ;;
@@ -239,6 +251,130 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# Ollama Cloud
+# --------------------------------------------------------------------------
+
+# Rewrites simple top-level `key = "value"` entries in config.toml. Done in
+# Python rather than sed because API keys are arbitrary strings that would need
+# escaping in a sed replacement.
+set_config_value() {
+    local key="$1" value="$2"
+    CONFIG_KEY="$key" CONFIG_VALUE="$value" python3 - <<'PY'
+import os
+import re
+
+key = os.environ["CONFIG_KEY"]
+value = os.environ["CONFIG_VALUE"]
+encoded = '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+with open("config.toml", encoding="utf-8") as handle:
+    lines = handle.readlines()
+
+pattern = re.compile(rf"^(\s*)#?\s*{re.escape(key)}\s*=")
+for index, line in enumerate(lines):
+    if pattern.match(line):
+        indent = pattern.match(line).group(1)
+        lines[index] = f"{indent}{key} = {encoded}\n"
+        break
+else:
+    raise SystemExit(f"key not found in config.toml: {key}")
+
+with open("config.toml", "w", encoding="utf-8") as handle:
+    handle.writelines(lines)
+PY
+}
+
+# Lists the models the subscription can actually reach. The hosted catalog
+# changes over time, so the model is chosen from live data instead of being
+# hardcoded here or in the provider registry.
+fetch_ollama_cloud_models() {
+    local api_key="$1"
+    curl -fsS --max-time 20 -H "Authorization: Bearer ${api_key}" \
+        "${OLLAMA_CLOUD_BASE_URL}/models" 2>/dev/null |
+        python3 -c 'import json,sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+ids = sorted({m.get("id","").strip() for m in payload.get("data", []) if isinstance(m, dict)} - {""})
+print("\n".join(ids))'
+}
+
+configure_ollama_cloud() {
+    log "Configuring Ollama Cloud as the LLM provider"
+
+    command -v python3 >/dev/null 2>&1 || {
+        warn "python3 not found on the host; skipping. Set llm_provider and ollama_cloud_api_key in config.toml by hand."
+        return 0
+    }
+    command -v curl >/dev/null 2>&1 || {
+        warn "curl not found on the host; skipping. Set llm_provider and ollama_cloud_api_key in config.toml by hand."
+        return 0
+    }
+
+    local api_key="${OLLAMA_API_KEY:-}"
+    if [[ -z "$api_key" ]]; then
+        if [[ -t 0 ]]; then
+            # Read silently so the key never appears on screen or in history.
+            read -rsp "  Ollama Cloud API key (https://ollama.com/settings/keys): " api_key
+            echo
+        else
+            warn "no OLLAMA_API_KEY set and no terminal to prompt on; skipping Ollama Cloud setup."
+            return 0
+        fi
+    fi
+    [[ -n "$api_key" ]] || { warn "empty API key; skipping Ollama Cloud setup."; return 0; }
+
+    local models model
+    models="$(fetch_ollama_cloud_models "$api_key" || true)"
+
+    if [[ -z "$models" ]]; then
+        # Could be a bad key, an expired subscription, or no route to
+        # ollama.com. Configure anyway so the WebUI's connection test can
+        # report the real reason.
+        warn "could not list models from ${OLLAMA_CLOUD_BASE_URL}/models."
+        warn "Check the key and the subscription; the WebUI's 'Test LLM Connection' button will show the exact error."
+        model="${OLLAMA_MODEL:-}"
+    else
+        ok "$(wc -l <<<"$models") cloud models available"
+        if [[ -n "${OLLAMA_MODEL:-}" ]]; then
+            model="$OLLAMA_MODEL"
+            grep -qxF "$model" <<<"$models" || warn "OLLAMA_MODEL='$model' is not in the catalog; configuring it anyway."
+        elif [[ -t 0 ]]; then
+            local -a options
+            mapfile -t options <<<"$models"
+            echo
+            local i
+            for i in "${!options[@]}"; do
+                printf '   %2d) %s\n' "$((i + 1))" "${options[$i]}"
+            done
+            local choice=""
+            read -rp "  Model number [1]: " choice
+            choice="${choice:-1}"
+            if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#options[@]})); then
+                model="${options[$((choice - 1))]}"
+            else
+                warn "invalid selection '$choice'; using ${options[0]}"
+                model="${options[0]}"
+            fi
+        else
+            model="$(head -n 1 <<<"$models")"
+            ok "no terminal to prompt on; selecting the first model: $model"
+        fi
+    fi
+
+    set_config_value "llm_provider" "ollama_cloud"
+    set_config_value "ollama_cloud_api_key" "$api_key"
+    set_config_value "ollama_cloud_base_url" "$OLLAMA_CLOUD_BASE_URL"
+    [[ -n "$model" ]] && set_config_value "ollama_cloud_model_name" "$model"
+
+    ok "llm_provider = ollama_cloud${model:+, model = $model}"
+    if [[ -z "$model" ]]; then
+        warn "no model selected; pick one in the WebUI under Basic Settings before generating."
+    fi
+}
+
+# --------------------------------------------------------------------------
 # Bring the stack up
 # --------------------------------------------------------------------------
 
@@ -299,6 +435,10 @@ main() {
     check_ports
     prepare_files "$host_ip" "$l4t_tag" "$runtime"
 
+    if [[ "$OLLAMA_CLOUD" -eq 1 ]]; then
+        configure_ollama_cloud
+    fi
+
     if [[ "$START" -eq 0 ]]; then
         log "--no-start given; stopping before pull/up"
         return 0
@@ -318,7 +458,8 @@ main() {
 
   The WebUI has no authentication and ${BIND_ADDR} exposes it to the LAN.
   Next step: open the WebUI and set your LLM and material API keys under
-  Basic Settings, or edit config.toml directly.
+  Basic Settings, or edit config.toml directly. The "Test LLM Connection"
+  button there confirms the provider end to end.
 EOF
 }
 
