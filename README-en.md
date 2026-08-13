@@ -200,6 +200,7 @@ All examples below were generated with MoneyPrinterTurbo.
 - Windows users: use the one-click package first for the fastest local trial
 - macOS / Linux users: use `uv` for the primary local setup path
 - If you want a more isolated runtime: use Docker deployment
+- NVIDIA Jetson Orin boards: use the Jetson deployment, which has its own compose file and installer
 
 ### Generate Videos with an AI Agent
 
@@ -265,7 +266,7 @@ docker compose -f docker-compose.release.yml up
 > The recommended default is `docker-compose.release.yml`, which pulls the prebuilt image from GitHub Container Registry: `ghcr.io/harry0703/moneyprinterturbo:latest`.
 > If you need to build the image locally, you can still run `docker compose up`.
 > Before the first start, copy `config.example.toml` to `config.toml` so it can be mounted into the containers.
-> On NVIDIA Jetson (Orin) boards, use `docker-compose.jetson.yml` instead — see [docs/jetson-orin.md](docs/jetson-orin.md). `docker-compose.gpu.yml` targets discrete GPUs and does not work on Tegra.
+> On NVIDIA Jetson (Orin) boards, use `docker-compose.jetson.yml` instead — see the Jetson section below. `docker-compose.gpu.yml` targets discrete GPUs and does not work on Tegra.
 
 #### ② Access the WebUI
 
@@ -274,6 +275,46 @@ Open your browser and visit http://127.0.0.1:8501
 #### ③ Access the API Documentation
 
 Open your browser and visit http://127.0.0.1:8080/docs or http://127.0.0.1:8080/redoc
+
+### NVIDIA Jetson Orin Deployment 🤖
+
+Jetson Orin boards (AGX Orin, Orin NX, Orin Nano) run aarch64 on NVIDIA's L4T stack and need their own compose file. `docker-compose.gpu.yml` targets discrete GPUs and does not work on Tegra. The full guide, including the CUDA build and troubleshooting, is in [docs/jetson-orin.md](docs/jetson-orin.md).
+
+#### ① Run the Installer
+
+```shell
+git clone https://github.com/harry0703/MoneyPrinterTurbo.git
+cd MoneyPrinterTurbo
+./scripts/install-jetson.sh
+```
+
+The script checks the platform, Docker and the NVIDIA container runtime, detects the board's L4T release and LAN address, creates `config.toml`, `storage/`, `models/` and `.env`, then pulls the `linux/arm64` release image and starts both services. Nothing is compiled on the board. Re-running it leaves existing configuration alone.
+
+Options: `--webui-port`, `--api-port`, `--bind`, `--gpu-build`, `--ollama-cloud`, `--no-start`.
+
+#### ② Access the Services
+
+The stack uses non-standard ports so it can share a board with other projects:
+
+- WebUI: `http://<jetson-ip>:3200`
+- API: `http://<jetson-ip>:8200` (documentation at `/docs`)
+
+Change them with `MPT_WEBUI_PORT` and `MPT_API_PORT` in `.env`, then bring the stack up again.
+
+> The WebUI has no authentication, and the installer binds to `0.0.0.0` by default, so anyone on your LAN can reach it and read the API keys in `config.toml`. On an untrusted network, set `MPT_BIND_ADDR=127.0.0.1` in `.env` and reach it over an SSH tunnel instead.
+
+#### ③ Optional: Run the LLM on Ollama Cloud
+
+Script generation is the one step that wants a large model, which the board cannot host well. An [ollama.com](https://ollama.com) subscription keeps it off the Jetson entirely:
+
+```shell
+export OLLAMA_API_KEY=...   # https://ollama.com/settings/keys
+./scripts/install-jetson.sh --ollama-cloud
+```
+
+The installer lists the models your subscription can reach, asks which to use, and writes the provider, key and model into `config.toml`. You can also select **Ollama Cloud** in the WebUI's LLM settings, where entering the API key loads the current model catalog for your account.
+
+> The GPU does little for this workload today: the only CUDA-capable dependency is `faster-whisper`, whose aarch64 wheels are CPU-only builds, and video encoding runs on `libx264`. The release image therefore runs without the NVIDIA container runtime. See "What the GPU actually does here" in [docs/jetson-orin.md](docs/jetson-orin.md).
 
 ### Manual Deployment 📦
 
@@ -357,6 +398,77 @@ run:
 ```shell
 uv run python cli.py --help
 ```
+
+## Starting & Stopping 🔄
+
+### Docker
+
+Every command below takes the compose file that matches your deployment:
+
+| Deployment | Compose file |
+| --- | --- |
+| Prebuilt image (recommended) | `docker-compose.release.yml` |
+| Image built locally | `docker-compose.yml` |
+| Jetson Orin | `docker-compose.jetson.yml` |
+
+```shell
+# start in the background
+docker compose -f docker-compose.release.yml up -d
+
+# check status and follow logs
+docker compose -f docker-compose.release.yml ps
+docker compose -f docker-compose.release.yml logs -f
+
+# apply edits made to config.toml by hand
+docker compose -f docker-compose.release.yml restart
+
+# stop the services, keeping the containers
+docker compose -f docker-compose.release.yml stop
+
+# stop and remove the containers
+docker compose -f docker-compose.release.yml down
+
+# update to the latest published image
+docker compose -f docker-compose.release.yml pull
+docker compose -f docker-compose.release.yml up -d
+```
+
+Both services are declared `restart: always`, so Docker starts them again after a reboot or a daemon restart. `stop` or `down` is what actually keeps them off. Running `up` without `-d` keeps them in the foreground instead, where `Ctrl+C` stops them.
+
+`down` removes the containers, not your data: `config.toml` and `storage/` are mounted from the project directory on the host, so generated videos and settings survive.
+
+### Local Deployment
+
+The WebUI and the API each run in the foreground, in their own terminal. **Press `Ctrl+C` in that terminal to stop them.**
+
+```shell
+sh webui.sh          # WebUI (macOS / Linux)
+.\webui.bat          # WebUI (Windows)
+uv run python main.py  # API service
+```
+
+`webui.sh` prefers port 8501 and falls back to the next free port up to 8599, printing the address it settled on:
+
+```text
+***** WebUI address: http://127.0.0.1:8501 *****
+```
+
+If a previous run was left behind and its port is still occupied, stop the process holding it.
+
+macOS / Linux:
+
+```shell
+lsof -ti tcp:8501 | xargs kill
+```
+
+Windows:
+
+```shell
+netstat -ano | findstr :8501
+taskkill /PID <pid> /F
+```
+
+With the Windows one-click package, close the console window that `start.bat` opened.
 
 ## Voice Synthesis 🗣
 
