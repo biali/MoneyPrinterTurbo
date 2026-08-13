@@ -42,3 +42,6 @@ htmlcov/
 .codegraph
 /docs/superpowers
 .understand-anything
+
+# Jetson/compose host overrides
+/.env

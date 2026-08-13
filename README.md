@@ -261,6 +261,7 @@ docker compose -f docker-compose.release.yml up
 > 默认推荐使用 `docker-compose.release.yml`，它会直接拉取 GitHub Container Registry 上的预构建镜像：`ghcr.io/harry0703/moneyprinterturbo:latest`。
 > 如果你需要本地重新构建镜像，可以继续使用 `docker compose up`。
 > 首次启动前，请将 `config.example.toml` 复制为 `config.toml`，供容器挂载使用。
+> NVIDIA Jetson（Orin）设备请改用 `docker-compose.jetson.yml`，详见 [docs/jetson-orin.md](docs/jetson-orin.md)。`docker-compose.gpu.yml` 面向独立显卡，在 Tegra 上无法使用。
 
 #### ② 访问 WebUI
 

@@ -1,0 +1,241 @@
+# Deploying on Jetson Orin
+
+Deployment guide for NVIDIA Jetson Orin modules (AGX Orin, Orin NX, Orin Nano)
+running JetPack 5 or 6. Everything here also applies to other Tegra boards
+running L4T.
+
+The stack listens on **3200 (WebUI)** and **8200 (API)** rather than the
+upstream 8501/8080, so it can share a board with other projects.
+
+## Why a separate compose file
+
+`docker-compose.gpu.yml` targets discrete NVIDIA GPUs and does not work on
+Jetson, for two independent reasons:
+
+- It builds from `Dockerfile.gpu`, whose base image is `nvidia/cuda`. The arm64
+  variants of that image target SBSA server platforms; they do not run against
+  Tegra's integrated GPU.
+- It requests the GPU through `deploy.resources.reservations.devices`. On
+  Tegra the integrated GPU is provided by the `nvidia` container *runtime*
+  instead, which JetPack installs as `nvidia-container-toolkit`.
+
+`docker-compose.jetson.yml` fixes both: it uses `runtime: nvidia`, and it
+defaults to the published multi-arch release image, which already includes a
+`linux/arm64` build (see `.github/workflows/docker-ghcr.yml`). Nothing is
+compiled on the board.
+
+## What the GPU actually does here
+
+Worth knowing before spending an evening on a CUDA build — this project has a
+small GPU surface:
+
+- **Subtitles.** `faster-whisper` (CTranslate2) is the only CUDA-capable
+  dependency, and only when `subtitle_provider = "whisper"`. The default
+  provider is `edge`, which is a network call. The CTranslate2 aarch64 wheels
+  on PyPI are CPU-only builds, so `whisper.device = "cuda"` fails on Jetson
+  even inside a CUDA container unless CTranslate2 is rebuilt from source with
+  CUDA support for Tegra. Keep `device = "cpu"` and `compute_type = "int8"`.
+- **Video encoding.** Final assembly runs through ffmpeg with `libx264` on the
+  CPU. `video_codec = "h264_nvenc"` is accepted by the config but does not help
+  here: Orin Nano has no NVENC block at all, and on Orin NX / AGX Orin the
+  encoder is driven through V4L2 (`nvv4l2h264enc`), not ffmpeg's `h264_nvenc`.
+  The encoder probe in `app/services/video.py` detects the missing encoder and
+  falls back to `libx264` automatically, so setting it is harmless but pointless.
+- **LLM, TTS and material search** are all remote API calls. No local inference.
+
+So: **run the release image**. The CUDA path below exists so that CUDA, cuDNN
+and TensorRT are present in the container if you later swap in a CUDA-enabled
+CTranslate2 build — it does not make the stock stack faster.
+
+## Requirements
+
+- Jetson Orin flashed with JetPack 5.x or 6.x
+- Docker with the compose v2 plugin: `sudo apt-get install -y docker.io docker-compose-v2`
+- The NVIDIA container runtime: `sudo apt-get install -y nvidia-container-toolkit`
+  (preinstalled on most JetPack images)
+- Your user in the `docker` group: `sudo usermod -aG docker $USER`, then log out
+  and back in
+- ~10 GB free disk for the release image path; considerably more for the CUDA
+  build
+
+Verify the runtime is registered:
+
+```bash
+docker info --format '{{json .Runtimes}}' | grep -o nvidia
+```
+
+`nvidia-smi` does not exist on Tegra — use `tegrastats` to watch GPU load.
+
+## Quick start
+
+On the Jetson:
+
+```bash
+git clone https://github.com/biali/MoneyPrinterTurbo.git
+cd MoneyPrinterTurbo
+git checkout claude/jetson-orin-docker-gpu-folzhi
+./scripts/install-jetson.sh
+```
+
+The script checks the platform, Docker and the nvidia runtime, detects the
+board's L4T release and LAN address, creates `config.toml`, `storage/`,
+`models/` and `.env`, then pulls the arm64 image and starts both containers.
+Re-running it leaves existing configuration alone.
+
+Options: `--webui-port`, `--api-port`, `--bind`, `--gpu-build`, `--no-start`.
+
+## Manual start
+
+```bash
+cp .env.jetson.example .env          # then edit MPT_HOST to this board's IP
+cp config.example.toml config.toml   # must exist as a file before the first up
+mkdir -p storage models
+docker compose -f docker-compose.jetson.yml up -d
+```
+
+`config.toml` has to exist before the first `up`. It is a bind mount, and
+Docker silently creates a root-owned *directory* in its place when the source
+file is missing. If that already happened: `sudo rmdir config.toml`.
+
+Then:
+
+- WebUI — http://192.168.1.156:3200
+- API — http://192.168.1.156:8200
+- API docs — http://192.168.1.156:8200/docs
+
+## Ports
+
+Host ports come from `.env`; the containers keep their internal 8501/8080.
+
+| Service | Host port | Container port | Variable |
+| --- | --- | --- | --- |
+| WebUI (Streamlit) | 3200 | 8501 | `MPT_WEBUI_PORT` |
+| API (FastAPI) | 8200 | 8080 | `MPT_API_PORT` |
+
+`MPT_BIND_ADDR` controls the bind address (`0.0.0.0` for LAN access,
+`127.0.0.1` to keep the stack local). `MPT_HOST` is the address Streamlit
+prints and builds browser URLs from — set it to the board's LAN IP.
+`MPT_RUNTIME` selects the container runtime (`nvidia` to attach the GPU, `runc`
+to start without it).
+
+To move to different ports, edit `.env` and run
+`docker compose -f docker-compose.jetson.yml up -d` again. Also update
+`endpoint` in `config.toml` if you change the API port, since generated
+download links are built from it.
+
+**The WebUI has no authentication.** With `MPT_BIND_ADDR=0.0.0.0` anyone on the
+LAN can reach it and read the API keys stored in `config.toml`. On an untrusted
+network, set `MPT_BIND_ADDR=127.0.0.1` and tunnel:
+`ssh -L 3200:127.0.0.1:3200 <user>@192.168.1.156`.
+
+## Configuration
+
+Edit `config.toml` on the host (it is mounted into both containers) or use the
+WebUI's Basic Settings panel. Restart after editing by hand:
+`docker compose -f docker-compose.jetson.yml restart`.
+
+Values that matter on this platform:
+
+```toml
+[app]
+endpoint = "http://192.168.1.156:8200"   # must match the published API port
+# video_codec = "libx264"                 # leave as-is; see the GPU section
+
+[whisper]
+device = "cpu"                            # CUDA CTranslate2 is unavailable on aarch64
+compute_type = "int8"
+model_size = "large-v3"                   # 'medium' or 'small' on 8 GB modules
+```
+
+Whisper models download to `models/` on the host, so they survive image
+updates. `large-v3` in `int8` needs roughly 1.5 GB of RAM plus working memory —
+tight alongside the rest of the stack on an 8 GB Orin Nano. Drop to `medium` or
+`small` if the container is OOM-killed, or stay on the default
+`subtitle_provider = "edge"`.
+
+## CUDA build (optional)
+
+Builds the image locally on top of `nvcr.io/nvidia/l4t-jetpack`, giving CUDA,
+cuDNN and TensorRT inside the container. Read the GPU section first — this does
+not accelerate the stock pipeline.
+
+```bash
+./scripts/install-jetson.sh --gpu-build
+# or
+docker compose -f docker-compose.jetson.yml -f docker-compose.jetson-gpu.yml up -d --build
+```
+
+The base image tag must match the board's L4T release, otherwise the CUDA
+userspace and the host kernel driver disagree:
+
+| L4T | JetPack | Tag |
+| --- | --- | --- |
+| R36.4 | 6.1 | `r36.4.0` |
+| R36.3 | 6.0 | `r36.3.0` |
+| R35.4.1 | 5.1.2 | `r35.4.1` |
+| R35.3.1 | 5.1.1 | `r35.3.1` |
+
+`cat /etc/nv_tegra_release` reports the release; `install-jetson.sh` detects it
+and writes `L4T_BASE_IMAGE` into `.env`.
+
+`Dockerfile.jetson` installs a standalone CPython 3.11 with `uv` and resolves
+from `uv.lock`. The l4t-jetpack bases ship Ubuntu's default interpreter (3.10 on
+r36, 3.8 on r35), both below this project's `requires-python`. Expect a long
+first build; the base image alone is several GB.
+
+## Operating
+
+```bash
+docker compose -f docker-compose.jetson.yml ps
+docker compose -f docker-compose.jetson.yml logs -f webui
+docker compose -f docker-compose.jetson.yml restart
+docker compose -f docker-compose.jetson.yml down
+
+# update to the latest release image
+docker compose -f docker-compose.jetson.yml pull
+docker compose -f docker-compose.jetson.yml up -d
+```
+
+Both services are `restart: always`, so they come back after a reboot once the
+Docker daemon is enabled (`sudo systemctl enable docker`).
+
+## Troubleshooting
+
+**`unknown or invalid runtime name: nvidia`** — the container toolkit is not
+registered. `sudo apt-get install -y nvidia-container-toolkit && sudo systemctl
+restart docker`. To run without the GPU in the meantime, set `MPT_RUNTIME=runc`
+in `.env` — the stack works, it just has no GPU access (which, per the GPU
+section above, costs nothing on the stock dependency set).
+
+**`manifest unknown` when pulling `nvcr.io/nvidia/l4t-jetpack`** — that tag is
+not published. Check the current tag list at
+https://catalog.ngc.nvidia.com/orgs/nvidia/containers/l4t-jetpack/tags and set
+`L4T_BASE_IMAGE` in `.env` to the closest tag with the same major release. If
+the pull is rejected rather than missing, run `docker login nvcr.io` first.
+
+**`exec format error`** — an amd64 image was pulled. Confirm with
+`docker image inspect ghcr.io/harry0703/moneyprinterturbo:latest --format '{{.Architecture}}'`;
+it must be `arm64`. Force a refresh: `docker rmi ghcr.io/harry0703/moneyprinterturbo:latest`
+then pull again.
+
+**`config.toml` shows up as a directory** — the first `up` ran before the file
+existed. `docker compose -f docker-compose.jetson.yml down && sudo rmdir
+config.toml && cp config.example.toml config.toml`.
+
+**Port already allocated** — another project holds 3200 or 8200. Change the
+ports in `.env` and bring the stack up again.
+
+**WebUI reachable on the Jetson but not from the LAN** — `MPT_BIND_ADDR` is
+`127.0.0.1`, or the host firewall blocks the port
+(`sudo ufw allow 3200/tcp`).
+
+**Streamlit prints the wrong URL** — set `MPT_HOST` in `.env` to the board's
+LAN address and restart.
+
+**Container OOM-killed during subtitle generation** — Whisper model too large
+for the module. Lower `whisper.model_size`, or switch
+`subtitle_provider` back to `edge`.
+
+**Video rendering is slow** — expected. Encoding is `libx264` on the Arm cores.
+Run `sudo nvpmodel -m 0 && sudo jetson_clocks` for maximum clocks, and lower the
+output resolution or clip count for faster turnaround.

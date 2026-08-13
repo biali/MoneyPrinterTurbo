@@ -265,6 +265,7 @@ docker compose -f docker-compose.release.yml up
 > The recommended default is `docker-compose.release.yml`, which pulls the prebuilt image from GitHub Container Registry: `ghcr.io/harry0703/moneyprinterturbo:latest`.
 > If you need to build the image locally, you can still run `docker compose up`.
 > Before the first start, copy `config.example.toml` to `config.toml` so it can be mounted into the containers.
+> On NVIDIA Jetson (Orin) boards, use `docker-compose.jetson.yml` instead — see [docs/jetson-orin.md](docs/jetson-orin.md). `docker-compose.gpu.yml` targets discrete GPUs and does not work on Tegra.
 
 #### ② Access the WebUI
 

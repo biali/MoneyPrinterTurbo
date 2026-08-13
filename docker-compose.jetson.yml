@@ -1,0 +1,57 @@
+# Jetson Orin (aarch64 / NVIDIA L4T) deployment.
+#
+# Default path — pulls the published multi-arch release image. linux/arm64 is
+# built by .github/workflows/docker-ghcr.yml, so nothing is compiled on the
+# Jetson:
+#
+#   docker compose -f docker-compose.jetson.yml up -d
+#
+# CUDA path — build locally from Dockerfile.jetson on top of an l4t-jetpack
+# base instead of pulling the release image:
+#
+#   docker compose -f docker-compose.jetson.yml -f docker-compose.jetson-gpu.yml up -d --build
+#
+# Ports are non-standard on purpose so this stack can share a Jetson with other
+# projects. Copy .env.jetson.example to .env to change them or to point
+# MPT_HOST at this host's LAN address.
+#
+# 说明：docker-compose.gpu.yml 面向独立显卡（nvidia/cuda 基础镜像 +
+# deploy.resources.devices），在 Jetson 的集成 GPU 上不可用，因此单独提供本文件。
+
+x-common-volumes: &common-volumes
+  - ./config.toml:/MoneyPrinterTurbo/config.toml
+  - ./storage:/MoneyPrinterTurbo/storage
+  # Whisper models are several GB; keeping them on the host avoids re-downloading
+  # them every time the image is replaced.
+  - ./models:/MoneyPrinterTurbo/models
+
+x-jetson-gpu: &jetson-gpu
+  # Tegra exposes the integrated GPU through the nvidia container runtime, not
+  # through `deploy.resources.reservations.devices` — that path asks for a
+  # discrete NVIDIA device and fails on Orin. Requires nvidia-container-toolkit,
+  # which JetPack installs by default; set MPT_RUNTIME=runc in .env to start
+  # without the GPU on a host where it is missing.
+  runtime: ${MPT_RUNTIME:-nvidia}
+  environment:
+    NVIDIA_VISIBLE_DEVICES: all
+    NVIDIA_DRIVER_CAPABILITIES: all
+
+services:
+  webui:
+    <<: *jetson-gpu
+    image: ghcr.io/harry0703/moneyprinterturbo:latest
+    container_name: "moneyprinterturbo-webui"
+    ports:
+      - "${MPT_BIND_ADDR:-0.0.0.0}:${MPT_WEBUI_PORT:-3200}:8501"
+    command: [ "streamlit", "run", "./webui/Main.py", "--server.address=0.0.0.0", "--server.port=8501", "--browser.serverAddress=${MPT_HOST:-localhost}", "--browser.serverPort=${MPT_WEBUI_PORT:-3200}", "--server.enableCORS=True", "--browser.gatherUsageStats=False", "--client.toolbarMode=minimal", "--logger.hideWelcomeMessage=True", "--server.showEmailPrompt=False" ]
+    volumes: *common-volumes
+    restart: always
+  api:
+    <<: *jetson-gpu
+    image: ghcr.io/harry0703/moneyprinterturbo:latest
+    container_name: "moneyprinterturbo-api"
+    ports:
+      - "${MPT_BIND_ADDR:-0.0.0.0}:${MPT_API_PORT:-8200}:8080"
+    command: [ "python3", "main.py" ]
+    volumes: *common-volumes
+    restart: always
