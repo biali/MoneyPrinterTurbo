@@ -1,6 +1,8 @@
 .DS_Store
 /config.toml
 /config.toml.bak
+# Host-specific Jetson deployment settings written by scripts/install-jetson.sh
+/.env
 /storage/
 /.idea/
 /app/services/__pycache__

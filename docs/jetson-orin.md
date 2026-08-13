@@ -62,6 +62,28 @@ So: **run the release image**. The CUDA path below exists so that CUDA, cuDNN
 and TensorRT are present in the container if you later swap in a CUDA-enabled
 CTranslate2 build — it does not make the stock stack faster.
 
+### Why the release image runs under runc
+
+Attaching the GPU is not free. On Tegra the nvidia container runtime works by
+mounting the host's libraries into the container, and those are built against
+the host's Ubuntu while the release image is Debian bullseye. The injected
+libraries shadow the container's own, and ffmpeg then fails partway through a
+render with:
+
+```
+/usr/bin/ffmpeg: error while loading shared libraries: libffi.so.8: cannot open shared object file
+```
+
+(bullseye ships `libffi.so.7`; Ubuntu 22.04 ships `libffi.so.8`). Since nothing
+in that image can use the GPU, `docker-compose.jetson.yml` defaults to
+`MPT_RUNTIME=runc` and asks only for `compute,utility` capabilities when the
+runtime is used at all — `all` additionally injects the host EGL/GL stack, which
+this workload never calls.
+
+`docker-compose.jetson-gpu.yml` switches the runtime back on for its own image,
+whose l4t-jetpack base matches the host userspace, so the same mounts are safe
+there.
+
 ## Requirements
 
 - Jetson Orin flashed with JetPack 5.x or 6.x
@@ -131,8 +153,8 @@ Host ports come from `.env`; the containers keep their internal 8501/8080.
 `MPT_BIND_ADDR` controls the bind address (`0.0.0.0` for LAN access,
 `127.0.0.1` to keep the stack local). `MPT_HOST` is the address Streamlit
 prints and builds browser URLs from — set it to the board's LAN IP.
-`MPT_RUNTIME` selects the container runtime (`nvidia` to attach the GPU, `runc`
-to start without it).
+`MPT_RUNTIME` selects the container runtime and defaults to `runc` on the
+release-image path; see the note below before setting it to `nvidia`.
 
 To move to different ports, edit `.env` and run
 `docker compose -f docker-compose.jetson.yml up -d` again. Also update
@@ -260,11 +282,22 @@ Docker daemon is enabled (`sudo systemctl enable docker`).
 
 ## Troubleshooting
 
+**`ffmpeg: error while loading shared libraries: libffi.so.8`** during video
+generation — the containers are running under the nvidia runtime, which mounted
+the host's Ubuntu libraries over the release image's Debian ones. Fix it with:
+
+```bash
+sed -i 's/^MPT_RUNTIME=.*/MPT_RUNTIME=runc/' .env
+docker compose -f docker-compose.jetson.yml up -d
+```
+
+Confirm afterwards with `docker compose -f docker-compose.jetson.yml exec -T
+webui ffmpeg -version`. See "Why the release image runs under runc" above.
+
 **`unknown or invalid runtime name: nvidia`** — the container toolkit is not
-registered. `sudo apt-get install -y nvidia-container-toolkit && sudo systemctl
-restart docker`. To run without the GPU in the meantime, set `MPT_RUNTIME=runc`
-in `.env` — the stack works, it just has no GPU access (which, per the GPU
-section above, costs nothing on the stock dependency set).
+registered, and something set `MPT_RUNTIME=nvidia`. Either set it back to `runc`
+in `.env`, or install the toolkit with `sudo apt-get install -y
+nvidia-container-toolkit && sudo systemctl restart docker`.
 
 **`manifest unknown` when pulling `nvcr.io/nvidia/l4t-jetpack`** — that tag is
 not published. Check the current tag list at

@@ -39,15 +39,27 @@ x-common-volumes: &common-volumes
   - ./:/MoneyPrinterTurbo
 
 x-jetson-gpu: &jetson-gpu
-  # Tegra exposes the integrated GPU through the nvidia container runtime, not
-  # through `deploy.resources.reservations.devices` — that path asks for a
-  # discrete NVIDIA device and fails on Orin. Requires nvidia-container-toolkit,
-  # which JetPack installs by default; set MPT_RUNTIME=runc in .env to start
-  # without the GPU on a host where it is missing.
-  runtime: ${MPT_RUNTIME:-nvidia}
+  # Deliberately NOT the nvidia runtime by default.
+  #
+  # Tegra exposes its integrated GPU by having the nvidia container runtime
+  # mount host libraries into the container (not through
+  # `deploy.resources.reservations.devices`, which asks for a discrete GPU and
+  # fails on Orin). Those libraries are built against the host's Ubuntu, while
+  # the release image is Debian bullseye. Injecting them shadows the container's
+  # own libraries with ones linked against a newer libffi, and ffmpeg then dies
+  # with "libffi.so.8: cannot open shared object file" partway through a render.
+  #
+  # Nothing in the release image can use the GPU anyway — see "What the GPU
+  # actually does here" in docs/jetson-orin.md — so the injection is all cost.
+  # The local CUDA build in docker-compose.jetson-gpu.yml turns the runtime back
+  # on: its l4t-jetpack base matches the host's userspace, so the mounts are safe
+  # there.
+  #
+  # Set MPT_RUNTIME=nvidia in .env to force GPU access on this path anyway.
+  runtime: ${MPT_RUNTIME:-runc}
   environment:
     NVIDIA_VISIBLE_DEVICES: all
-    NVIDIA_DRIVER_CAPABILITIES: all
+    NVIDIA_DRIVER_CAPABILITIES: ${MPT_NVIDIA_CAPS:-compute,utility}
 
 services:
   webui:

@@ -108,19 +108,47 @@ check_docker() {
     ok "docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'), compose plugin present"
 }
 
-# The compose file requests `runtime: ${MPT_RUNTIME:-nvidia}`. Without the
-# runtime registered, `up` fails outright, so it is checked before anything is
-# created and .env is written with a runtime that actually exists.
-check_nvidia_runtime() {
-    log "Checking NVIDIA container runtime"
+# Picks the container runtime for this install.
+#
+# The release image is Debian bullseye. The nvidia runtime mounts the host's
+# Ubuntu-built libraries into the container, which shadow bullseye's own and
+# leave ffmpeg unable to load libffi.so.8 mid-render. Nothing in that image uses
+# the GPU, so the default path runs under runc. The CUDA build is based on
+# l4t-jetpack, matching the host userspace, so it takes the nvidia runtime.
+#
+# Only the runtime name goes to stdout; every message is routed to stderr so it
+# cannot end up inside the captured value.
+select_runtime() {
+    if [[ "$GPU_BUILD" -eq 0 ]]; then
+        ok "runtime: runc (release image is Debian-based; host library injection breaks its ffmpeg)" >&2
+        printf 'runc'
+        return 0
+    fi
+
+    log "Checking NVIDIA container runtime" >&2
     if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
-        ok "nvidia runtime registered"
+        ok "runtime: nvidia" >&2
+        printf 'nvidia'
         return 0
     fi
     warn "the nvidia container runtime is not registered with Docker."
     warn "Install it with: sudo apt-get install -y nvidia-container-toolkit && sudo systemctl restart docker"
-    warn "Falling back to MPT_RUNTIME=runc: the stack still runs, but without GPU access."
-    return 1
+    warn "Falling back to runc: the stack still runs, but without GPU access."
+    printf 'runc'
+}
+
+# An .env from an earlier run is otherwise left untouched, which would keep a
+# stale MPT_RUNTIME=nvidia in place and reproduce the ffmpeg failure this
+# default was changed to avoid.
+reconcile_env_runtime() {
+    local runtime="$1" current
+    [[ -f .env ]] || return 0
+
+    current="$(sed -n 's/^MPT_RUNTIME=//p' .env | head -n 1)"
+    [[ -n "$current" && "$current" != "$runtime" ]] || return 0
+
+    sed -i "s|^MPT_RUNTIME=.*|MPT_RUNTIME=${runtime}|" .env
+    ok "updated MPT_RUNTIME in .env: ${current} -> ${runtime}"
 }
 
 # --------------------------------------------------------------------------
@@ -244,6 +272,7 @@ MPT_API_PORT=${API_PORT}
 MPT_BIND_ADDR=${BIND_ADDR}
 MPT_HOST=${host_ip}
 MPT_RUNTIME=${runtime}
+MPT_NVIDIA_CAPS=compute,utility
 L4T_BASE_IMAGE=nvcr.io/nvidia/l4t-jetpack:${l4t_tag}
 EOF
         ok ".env written (webui ${WEBUI_PORT}, api ${API_PORT}, bind ${BIND_ADDR}, runtime ${runtime})"
@@ -440,8 +469,8 @@ wait_for_webui() {
 main() {
     check_platform
     check_docker
-    local runtime="nvidia"
-    check_nvidia_runtime || runtime="runc"
+    local runtime
+    runtime="$(select_runtime)"
 
     local host_ip l4t_tag
     host_ip="$(detect_lan_ip)"
@@ -456,6 +485,7 @@ main() {
 
     check_ports
     prepare_files "$host_ip" "$l4t_tag" "$runtime"
+    reconcile_env_runtime "$runtime"
 
     if [[ "$OLLAMA_CLOUD" -eq 1 ]]; then
         configure_ollama_cloud
