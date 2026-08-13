@@ -19,11 +19,24 @@
 # deploy.resources.devices），在 Jetson 的集成 GPU 上不可用，因此单独提供本文件。
 
 x-common-volumes: &common-volumes
-  - ./config.toml:/MoneyPrinterTurbo/config.toml
-  - ./storage:/MoneyPrinterTurbo/storage
-  # Whisper models are several GB; keeping them on the host avoids re-downloading
-  # them every time the image is replaced.
-  - ./models:/MoneyPrinterTurbo/models
+  # This checkout is mounted over the image's own copy of the application, the
+  # same way the upstream docker-compose.yml does it. The release image supplies
+  # the installed Python dependencies and ffmpeg; the code that actually runs
+  # comes from this repository.
+  #
+  # Without this, the containers run upstream's code and anything added here —
+  # the ollama_cloud provider, for example — simply does not exist inside them.
+  # An unknown llm_provider is silently reset to the default in the WebUI
+  # (webui/Main.py), so the failure shows up as a provider that keeps reverting
+  # rather than as an error.
+  #
+  # config.toml, storage/ and models/ live in this directory, so they are
+  # covered by the same mount and still persist on the host.
+  #
+  # Note: dependencies come from the image. If this checkout ever gains a new
+  # Python dependency, switch to the local build in
+  # docker-compose.jetson-gpu.yml, which installs from uv.lock.
+  - ./:/MoneyPrinterTurbo
 
 x-jetson-gpu: &jetson-gpu
   # Tegra exposes the integrated GPU through the nvidia container runtime, not

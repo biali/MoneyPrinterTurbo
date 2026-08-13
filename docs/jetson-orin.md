@@ -24,6 +24,19 @@ defaults to the published multi-arch release image, which already includes a
 `linux/arm64` build (see `.github/workflows/docker-ghcr.yml`). Nothing is
 compiled on the board.
 
+That release image ships **upstream's** application code, so this checkout is
+mounted over it at `/MoneyPrinterTurbo` (the same arrangement as the upstream
+`docker-compose.yml`). Dependencies and ffmpeg come from the image; the code
+that runs comes from this repository. Without that mount, anything added here —
+the Ollama Cloud provider, for one — is absent from the container, and because
+the WebUI silently resets an unrecognised `llm_provider` to the default, the
+symptom is a provider that will not stay selected rather than a visible error.
+`install-jetson.sh` checks for this after starting the stack.
+
+If this checkout ever gains a new Python dependency, the image will not have it;
+switch to the local build in `docker-compose.jetson-gpu.yml`, which installs
+from `uv.lock`.
+
 ## What the GPU actually does here
 
 Worth knowing before spending an evening on a CUDA build — this project has a
@@ -277,6 +290,21 @@ ports in `.env` and bring the stack up again.
 
 **Streamlit prints the wrong URL** — set `MPT_HOST` in `.env` to the board's
 LAN address and restart.
+
+**Ollama Cloud is missing from the LLM provider list, or the provider keeps
+reverting to another one** — the containers are running upstream's code instead
+of this checkout. Confirm with:
+
+```bash
+docker compose -f docker-compose.jetson.yml exec -T webui \
+  python3 -c "from app.models.llm_provider import get_llm_provider; print(get_llm_provider('ollama_cloud'))"
+```
+
+`None` means the mount is missing. Check that `docker-compose.jetson.yml` still
+maps `./:/MoneyPrinterTurbo`, then `docker compose -f docker-compose.jetson.yml
+up -d`. The WebUI resets an `llm_provider` it does not recognise to the default
+without warning, which is why this looks like a UI problem rather than a
+deployment one.
 
 **Container OOM-killed during subtitle generation** — Whisper model too large
 for the module. Lower `whisper.model_size`, or switch

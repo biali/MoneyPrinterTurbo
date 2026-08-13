@@ -400,6 +400,28 @@ start_stack() {
     compose ps
 }
 
+# The release image ships upstream's application code. docker-compose.jetson.yml
+# mounts this checkout over it, but a stale compose file or a hand-edited volume
+# list silently puts upstream's code back — and an unknown llm_provider is then
+# quietly reset to the default instead of raising. Check a provider that only
+# exists in this repository, so that mistake surfaces here rather than as a
+# provider that will not stay selected.
+verify_local_code_is_live() {
+    local probe
+    probe='from app.models.llm_provider import get_llm_provider
+raise SystemExit(0 if get_llm_provider("ollama_cloud") else 1)'
+
+    if compose exec -T webui python3 -c "$probe" >/dev/null 2>&1; then
+        ok "containers are running this checkout"
+        return 0
+    fi
+
+    warn "the running container does not expose this checkout's code."
+    warn "Ollama Cloud will be missing from the WebUI and any llm_provider it does not know is silently reset to the default."
+    warn "Check that docker-compose.jetson.yml still mounts './:/MoneyPrinterTurbo', then re-run: docker compose -f $COMPOSE_BASE up -d"
+    return 1
+}
+
 wait_for_webui() {
     local i
     command -v curl >/dev/null 2>&1 || return 0
@@ -446,6 +468,7 @@ main() {
 
     start_stack
     wait_for_webui || true
+    verify_local_code_is_live || true
 
     cat <<EOF
 
