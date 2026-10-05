@@ -93,6 +93,10 @@ class VideoParams(BaseModel):
     )
     
     custom_audio_file: Optional[str] = None  # Custom audio file path, will ignore TTS and can still use Whisper subtitles
+    # Ready-made SRT (task-local or server path) burned in as-is; used for song lyrics
+    custom_subtitle_file: Optional[str] = None
+    # Per-request override of config.app.subtitle_provider ("edge", "whisper" or "")
+    subtitle_provider: Optional[str] = None
     video_language: Optional[str] = ""  # auto detect
 
     voice_name: Optional[str] = ""
