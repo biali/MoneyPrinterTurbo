@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import shutil
 import socket
 import threading
 import time
@@ -337,8 +338,12 @@ def save_script_data(task_id, video_script, video_terms, params):
     task_artifacts.write_script_data(task_id, script_data)
 
 
-def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> str:
-    requested_file = (custom_audio_file or "").strip()
+def _resolve_custom_file(task_id: str, requested: str | None, label: str) -> str:
+    """Resolve a user-supplied file: task-local first, then an existing server path.
+
+    Relative server paths must stay inside the project directory.
+    """
+    requested_file = (requested or "").strip()
     if not requested_file:
         return ""
 
@@ -351,7 +356,7 @@ def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> st
     except ValueError as exc:
         task_dir_error = exc
 
-    server_audio_file = path.realpath(
+    server_file = path.realpath(
         requested_file
         if path.isabs(requested_file)
         else path.join(utils.root_dir(), requested_file)
@@ -359,21 +364,29 @@ def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> st
     if not path.isabs(requested_file):
         project_root = path.realpath(utils.root_dir())
         try:
-            if path.commonpath([project_root, server_audio_file]) != project_root:
+            if path.commonpath([project_root, server_file]) != project_root:
                 raise ValueError(
-                    "relative custom audio paths must stay within the project directory"
+                    f"relative custom {label} paths must stay within the project directory"
                 )
         except ValueError as exc:
             raise ValueError(
-                "custom audio file must be task-local or an existing server-side file"
+                f"custom {label} file must be task-local or an existing server-side file"
             ) from exc
 
-    if not path.isfile(server_audio_file):
+    if not path.isfile(server_file):
         raise ValueError(
-            "custom audio file does not exist or is not a file"
+            f"custom {label} file does not exist or is not a file"
         ) from task_dir_error
 
-    return server_audio_file
+    return server_file
+
+
+def resolve_custom_audio_file(task_id: str, custom_audio_file: str | None) -> str:
+    return _resolve_custom_file(task_id, custom_audio_file, "audio")
+
+
+def resolve_custom_subtitle_file(task_id: str, custom_subtitle_file: str | None) -> str:
+    return _resolve_custom_file(task_id, custom_subtitle_file, "subtitle")
 
 
 def _resolve_reusable_voice_preview(
@@ -505,6 +518,21 @@ def generate_audio(task_id, params, video_script, voice_preview=None):
             return None, None, None
         return custom_audio_file, audio_duration, None
 
+def use_custom_subtitle(task_id: str, custom_subtitle: str, subtitle_path: str) -> str:
+    """Copy a ready-made SRT (e.g. synced song lyrics) to the task's subtitle path.
+
+    Raises ``ValueError`` when the file cannot be resolved or has no valid cues, so
+    the task fails loudly instead of silently rendering without the lyrics.
+    """
+    source = resolve_custom_subtitle_file(task_id, custom_subtitle)
+    if path.realpath(source) != path.realpath(subtitle_path):
+        shutil.copyfile(source, subtitle_path)
+    if not subtitle.file_to_subtitles(subtitle_path):
+        raise ValueError("custom subtitle file has no valid SRT cues")
+    logger.info(f"using custom subtitle file: {source}")
+    return subtitle_path
+
+
 def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     '''
     Generate subtitle for the video script.
@@ -518,7 +546,14 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
         return ""
 
     subtitle_path = path.join(utils.task_dir(task_id), "subtitle.srt")
-    subtitle_provider = config.app.get("subtitle_provider", "edge").strip().lower()
+    custom_subtitle = getattr(params, "custom_subtitle_file", None)
+    if custom_subtitle:
+        return use_custom_subtitle(task_id, custom_subtitle, subtitle_path)
+
+    subtitle_provider = getattr(params, "subtitle_provider", None)
+    if subtitle_provider is None:
+        subtitle_provider = config.app.get("subtitle_provider", "edge")
+    subtitle_provider = subtitle_provider.strip().lower()
     logger.info(f"\n\n## generating subtitle, provider: {subtitle_provider}")
 
     if not subtitle_provider:
@@ -1153,9 +1188,14 @@ def _run_pipeline(
         return {"audio_file": audio_file, "audio_duration": audio_duration}
 
     # 4. Generate subtitle
-    subtitle_path = generate_subtitle(
-        task_id, params, video_script, sub_maker, audio_file
-    )
+    try:
+        subtitle_path = generate_subtitle(
+            task_id, params, video_script, sub_maker, audio_file
+        )
+    except ValueError as exc:
+        # Only a supplied custom subtitle raises here: rendering a music video
+        # without the requested lyrics would silently produce the wrong result.
+        return _mark_task_failed(task_id, "subtitle", str(exc))
 
     if stop_at == "subtitle":
         sm.state.update_task(

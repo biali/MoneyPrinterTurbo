@@ -5,7 +5,8 @@ import shutil
 from typing import Union
 
 from fastapi import BackgroundTasks, Depends, Path, Query, Request, UploadFile
-from fastapi.params import File
+from fastapi.params import File, Form
+from pydantic import ValidationError
 from fastapi.responses import FileResponse, StreamingResponse
 from loguru import logger
 
@@ -192,12 +193,105 @@ def create_audio(
     return create_task(request, body, stop_at="audio")
 
 
+MUSIC_VIDEO_AUDIO_SUFFIXES = ("mp3", "wav", "flac", "m4a", "aac", "ogg", "opus")
+MUSIC_VIDEO_MAX_AUDIO_BYTES = 200 * 1024 * 1024
+MUSIC_VIDEO_MAX_SUBTITLE_BYTES = 2 * 1024 * 1024
+_UPLOAD_CHUNK_BYTES = 1024 * 1024
+
+
+def _save_task_upload(
+    upload: UploadFile,
+    task_dir: str,
+    stem: str,
+    allowed_suffixes: tuple,
+    max_bytes: int,
+    request_id: str,
+) -> str:
+    """Stream an upload into the task directory as ``<stem>.<ext>`` and return that name.
+
+    The client filename only contributes its extension, so nothing it sends can
+    choose where the file lands; oversized uploads are rejected mid-stream.
+    """
+    safe_filename = _sanitize_upload_filename(upload.filename, request_id)
+    suffix = pathlib.Path(safe_filename).suffix.lower().lstrip(".")
+    if suffix not in allowed_suffixes:
+        raise HttpException(
+            task_id=request_id,
+            status_code=400,
+            message=f"{request_id}: {stem} must be one of {', '.join(allowed_suffixes)}",
+        )
+    name = f"{stem}.{suffix}"
+    written = 0
+    with open(os.path.join(task_dir, name), "wb") as buffer:
+        while chunk := upload.file.read(_UPLOAD_CHUNK_BYTES):
+            written += len(chunk)
+            if written > max_bytes:
+                raise HttpException(
+                    task_id=request_id,
+                    status_code=400,
+                    message=f"{request_id}: {stem} exceeds {max_bytes // (1024 * 1024)} MB",
+                )
+            buffer.write(chunk)
+    if written == 0:
+        raise HttpException(
+            task_id=request_id, status_code=400, message=f"{request_id}: {stem} is empty"
+        )
+    return name
+
+
+@router.post(
+    "/music_videos",
+    response_model=TaskResponse,
+    summary="Generate a music video for an uploaded song",
+    description=(
+        "Multipart form: `audio` (the song, used as the only audio track), optional "
+        "`subtitle` (an SRT of the synced lyrics, burned in as-is) and `params` (a JSON "
+        "TaskVideoRequest). Background music is disabled. Without `subtitle`, set "
+        "`params.subtitle_provider` to `whisper` to time `video_script` against the song."
+    ),
+)
+def create_music_video(
+    request: Request,
+    params: str = Form(...),
+    audio: UploadFile = File(...),
+    subtitle: UploadFile | None = File(None),
+):
+    request_id = base.get_task_id(request)
+    try:
+        body = TaskVideoRequest.model_validate_json(params)
+    except ValidationError as exc:
+        raise HttpException(
+            task_id=request_id, status_code=400, message=f"{request_id}: invalid params: {exc}"
+        )
+
+    task_id = utils.get_uuid()
+    task_dir = utils.task_dir(task_id)
+    try:
+        body.custom_audio_file = _save_task_upload(
+            audio, task_dir, "song", MUSIC_VIDEO_AUDIO_SUFFIXES,
+            MUSIC_VIDEO_MAX_AUDIO_BYTES, request_id,
+        )
+        if subtitle is not None and subtitle.filename:
+            body.custom_subtitle_file = _save_task_upload(
+                subtitle, task_dir, "lyrics", ("srt",),
+                MUSIC_VIDEO_MAX_SUBTITLE_BYTES, request_id,
+            )
+        # The song is the soundtrack: never mix background music or attenuate it.
+        body.bgm_type = ""
+        body.voice_volume = 1.0
+        return create_task(request, body, stop_at="video", task_id=task_id)
+    except HttpException:
+        shutil.rmtree(task_dir, ignore_errors=True)
+        raise
+
+
 def create_task(
     request: Request,
     body: Union[TaskVideoRequest, SubtitleRequest, AudioRequest],
     stop_at: str,
+    task_id: str | None = None,
 ):
-    task_id = utils.get_uuid()
+    task_id = task_id or utils.get_uuid()
     request_id = base.get_task_id(request)
     try:
         task = {
